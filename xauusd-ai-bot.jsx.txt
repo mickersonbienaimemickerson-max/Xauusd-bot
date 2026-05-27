@@ -1,0 +1,770 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ══════════════════════════════════════════════════════════════
+// COLOUR SYSTEM
+// ══════════════════════════════════════════════════════════════
+const C = {
+  bg:      "#04060c",
+  surface: "#080d18",
+  panel:   "#0c1220",
+  border:  "#172030",
+  hi:      "#243550",
+  bull:    "#00e8a2",
+  bear:    "#ff2d55",
+  gold:    "#ffd060",
+  blue:    "#38a4ff",
+  purple:  "#b06aff",
+  orange:  "#ff8c38",
+  text:    "#cddaec",
+  muted:   "#3d5878",
+  dim:     "#111d2c",
+};
+
+// ══════════════════════════════════════════════════════════════
+// MARKET ENGINE
+// ══════════════════════════════════════════════════════════════
+const SYMBOL = "XAUUSD";
+const BASE_GOLD = 2345.80;
+
+function genCandles(n = 200) {
+  let p = BASE_GOLD;
+  return Array.from({ length: n }, (_, i) => {
+    const v = p * 0.0025;
+    const o = p + (Math.random() - .5) * v;
+    const c = o + (Math.random() - .5) * v * 2;
+    const h = Math.max(o, c) + Math.random() * v * .7;
+    const l = Math.min(o, c) - Math.random() * v * .7;
+    p = c;
+    return { t: Date.now() - (n - i) * 60000, o, h, l, c, vol: 300 + Math.random() * 1400 };
+  });
+}
+
+// ══════════════════════════════════════════════════════════════
+// INDICATORS (mirrors Python code)
+// ══════════════════════════════════════════════════════════════
+function computeATR(candles, period = 14) {
+  return candles.map((_, i) => {
+    if (i < period) return candles[i].h - candles[i].l;
+    const sl = candles.slice(i - period, i);
+    return sl.reduce((s, c) => s + (c.h - c.l), 0) / period;
+  });
+}
+
+function ema(arr, period) {
+  const k = 2 / (period + 1);
+  const out = [arr[0]];
+  for (let i = 1; i < arr.length; i++) out.push(arr[i] * k + out[i - 1] * (1 - k));
+  return out;
+}
+
+function computeRSI(closes, period = 14) {
+  return closes.map((_, i) => {
+    if (i < period) return 50;
+    let g = 0, l = 0;
+    for (let j = i - period + 1; j <= i; j++) {
+      const d = closes[j] - closes[j - 1];
+      d > 0 ? g += d : l -= d;
+    }
+    return 100 - 100 / (1 + g / (l || .0001));
+  });
+}
+
+// ══════════════════════════════════════════════════════════════
+// REGIME DETECTOR  (Python: detect_regime)
+// ══════════════════════════════════════════════════════════════
+function detectRegime(candles) {
+  const closes = candles.map(c => c.c);
+  const atrArr = computeATR(candles);
+  const fast = ema(closes, 20);
+  const slow = ema(closes, 50);
+  const n = closes.length - 1;
+  const slope = fast[n] - slow[n];
+  const atrNow = atrArr[n];
+  const atrMean = atrArr.reduce((s, v) => s + v, 0) / atrArr.length;
+  if (slope > 0 && atrNow > atrMean) return "TREND_UP";
+  if (slope < 0 && atrNow > atrMean) return "TREND_DOWN";
+  return "RANGE";
+}
+
+// ══════════════════════════════════════════════════════════════
+// LIQUIDITY SWEEP DETECTOR (Python: detect_liquidity_sweep)
+// ══════════════════════════════════════════════════════════════
+function detectLiquiditySweep(candles) {
+  const n = candles.length - 1;
+  const prev = candles[n - 1], last = candles[n];
+  if (last.l < prev.l && last.c > prev.l) return "SWEEP_BUY";
+  if (last.h > prev.h && last.c < prev.h) return "SWEEP_SELL";
+  return "NO_SWEEP";
+}
+
+// ══════════════════════════════════════════════════════════════
+// MOMENTUM CONFIRMATION  (Python: momentum_confirmation)
+// ══════════════════════════════════════════════════════════════
+function momentumConfirmation(candles) {
+  const c = candles[candles.length - 1];
+  const body = Math.abs(c.c - c.o);
+  const range = c.h - c.l;
+  return range > 0 && body / range > 0.60;
+}
+
+// ══════════════════════════════════════════════════════════════
+// SCALPING SIGNAL  (Python: scalping_signal)
+// ══════════════════════════════════════════════════════════════
+function scalpingSignal(candles, regime) {
+  if (!["TREND_UP", "TREND_DOWN"].includes(regime)) return "NO_TRADE";
+  const sweep = detectLiquiditySweep(candles);
+  const momentum = momentumConfirmation(candles);
+  if (regime === "TREND_UP"   && sweep === "SWEEP_BUY"  && momentum) return "SCALP_BUY";
+  if (regime === "TREND_DOWN" && sweep === "SWEEP_SELL" && momentum) return "SCALP_SELL";
+  return "NO_TRADE";
+}
+
+// ══════════════════════════════════════════════════════════════
+// XGBoost MODEL SIMULATOR (Python: SignalModel)
+// ══════════════════════════════════════════════════════════════
+function xgboostPredict(candles, regime) {
+  const closes = candles.map(c => c.c);
+  const atrArr = computeATR(candles);
+  const fast = ema(closes, 20);
+  const slow = ema(closes, 50);
+  const n = closes.length - 1;
+  const ret = (closes[n] - closes[n - 1]) / closes[n - 1];
+  const atrNorm = atrArr[n] / closes[n];
+  const emaDiff = (fast[n] - slow[n]) / closes[n];
+  // Simulate feature weighting (tree ensemble logic approximation)
+  let score = 0;
+  score += emaDiff > 0 ? 1.2 : -1.2;
+  score += ret > 0 ? 0.8 : -0.8;
+  score += atrNorm > 0.002 ? 0.5 : -0.2;
+  const noise = (Math.random() - .5) * 0.6;
+  score += noise;
+  const confidence = Math.min(0.95, 0.55 + Math.abs(score) * 0.07 + Math.random() * 0.08);
+  const prediction = score > 0.4 ? 1 : score < -0.4 ? -1 : 0;
+  return { prediction, confidence };
+}
+
+// ══════════════════════════════════════════════════════════════
+// SIGNAL FUSION  (Python: generate_signal)
+// ══════════════════════════════════════════════════════════════
+function generateSignal(regime, prediction, confidence) {
+  if (confidence < 0.60) return "NO_TRADE";
+  if (regime === "TREND_UP"   && prediction === 1)  return "BUY";
+  if (regime === "TREND_DOWN" && prediction === -1) return "SELL";
+  if (regime === "RANGE")                           return "MEAN_REVERSION";
+  return "NO_TRADE";
+}
+
+// ══════════════════════════════════════════════════════════════
+// RISK ENGINE  (Python: risk_per_trade)
+// ══════════════════════════════════════════════════════════════
+function riskPerTrade(regime) {
+  if (regime === "TREND_UP" || regime === "TREND_DOWN") return 0.02;
+  if (regime === "RANGE") return 0.01;
+  return 0.005;
+}
+
+function riskToLot(risk, balance = 10000) {
+  const usdRisk = balance * risk;
+  return Math.max(0.01, +(usdRisk / 1000).toFixed(2));
+}
+
+// ══════════════════════════════════════════════════════════════
+// SESSION FILTER  (Python: trading_session_filter)
+// ══════════════════════════════════════════════════════════════
+function tradingSessionFilter() {
+  const h = new Date().getUTCHours();
+  return h >= 7 && h <= 20;
+}
+
+// ══════════════════════════════════════════════════════════════
+// FULL BOT BRAIN  (Python: run_bot / autonomous_bot)
+// ══════════════════════════════════════════════════════════════
+function runBot(candles, balance) {
+  const regime = detectRegime(candles);
+  const { prediction, confidence } = xgboostPredict(candles, regime);
+  const sweep = detectLiquiditySweep(candles);
+  const scalp = scalpingSignal(candles, regime);
+  const aiSignal = generateSignal(regime, prediction, confidence);
+  const risk = riskPerTrade(regime);
+  const lot = riskToLot(risk, balance);
+  const inSession = tradingSessionFilter();
+  const closes = candles.map(c => c.c);
+  const atrArr = computeATR(candles);
+  const n = closes.length - 1;
+  const atr = atrArr[n];
+  const price = closes[n];
+  // Final fusion: scalping AND ai must agree (Python condition: signal != NO_TRADE && final_signal != NO_TRADE)
+  let finalSignal = "NO_TRADE";
+  if (inSession && scalp !== "NO_TRADE" && aiSignal !== "NO_TRADE") {
+    finalSignal = scalp;
+  }
+  const sl = finalSignal.includes("BUY")  ? price - atr * 1.5 : finalSignal.includes("SELL") ? price + atr * 1.5 : null;
+  const tp = finalSignal.includes("BUY")  ? price + atr * 3   : finalSignal.includes("SELL") ? price - atr * 3   : null;
+  return { regime, prediction, confidence, sweep, scalp, aiSignal, finalSignal, risk, lot, atr, price, sl, tp, inSession };
+}
+
+// ══════════════════════════════════════════════════════════════
+// CHART
+// ══════════════════════════════════════════════════════════════
+function GoldChart({ candles, bot }) {
+  const W = 640, H = 230;
+  if (!candles || candles.length < 10) return null;
+  const recent = candles.slice(-70);
+  const closes = recent.map(c => c.c);
+  const e20 = ema(closes, 20), e50 = ema(closes, 50);
+  const mn = Math.min(...recent.map(c => c.l)), mx = Math.max(...recent.map(c => c.h)), rng = mx - mn || 1;
+  const cw = W / recent.length;
+  const py = v => H - ((v - mn) / rng) * (H - 22) - 11;
+  const px = i => i * cw + cw * .5;
+  const ep20 = e20.map((v, i) => `${i === 0 ? "M" : "L"}${px(i)},${py(v)}`).join(" ");
+  const ep50 = e50.map((v, i) => `${i === 0 ? "M" : "L"}${px(i)},${py(v)}`).join(" ");
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: H }}>
+      <defs>
+        <linearGradient id="gg" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={C.gold} stopOpacity=".15" />
+          <stop offset="100%" stopColor={C.gold} stopOpacity="0" />
+        </linearGradient>
+        <pattern id="dotgrid" width="30" height="20" patternUnits="userSpaceOnUse">
+          <circle cx="1" cy="1" r=".4" fill={C.border} />
+        </pattern>
+      </defs>
+      <rect width={W} height={H} fill="url(#dotgrid)" />
+      {bot?.sl && <><line x1="0" y1={py(bot.sl)} x2={W} y2={py(bot.sl)} stroke={C.bear} strokeWidth=".9" strokeDasharray="4,4" opacity=".6" /><text x="4" y={py(bot.sl) - 3} fill={C.bear} fontSize="8" fontFamily="monospace">SL</text></>}
+      {bot?.tp && <><line x1="0" y1={py(bot.tp)} x2={W} y2={py(bot.tp)} stroke={C.bull} strokeWidth=".9" strokeDasharray="4,4" opacity=".6" /><text x="4" y={py(bot.tp) - 3} fill={C.bull} fontSize="8" fontFamily="monospace">TP</text></>}
+      {recent.map((c, i) => {
+        const bull = c.c >= c.o, col = bull ? C.bull : C.bear;
+        const bh = Math.max(1, Math.abs(py(c.o) - py(c.c)));
+        return <g key={i}>
+          <line x1={px(i)} y1={py(c.h)} x2={px(i)} y2={py(c.l)} stroke={col} strokeWidth=".9" opacity=".8" />
+          <rect x={px(i) - cw * .38} y={py(Math.max(c.o, c.c))} width={cw * .76} height={bh} fill={col} opacity=".85" />
+        </g>;
+      })}
+      <path d={ep20} fill="none" stroke={C.gold} strokeWidth="1.4" opacity=".85" />
+      <path d={ep50} fill="none" stroke={C.purple} strokeWidth="1.4" opacity=".85" />
+      <text x="6" y="13" fill={C.gold} fontSize="9" fontFamily="monospace">EMA20</text>
+      <text x="55" y="13" fill={C.purple} fontSize="9" fontFamily="monospace">EMA50</text>
+    </svg>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+// CONFIDENCE METER
+// ══════════════════════════════════════════════════════════════
+function ConfidenceMeter({ value }) {
+  const pct = value * 100;
+  const col = pct >= 70 ? C.bull : pct >= 60 ? C.gold : C.bear;
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: C.muted, marginBottom: 4 }}>
+        <span>CONFIANCE XGBOOST</span><span style={{ color: col, fontWeight: 700 }}>{pct.toFixed(1)}%</span>
+      </div>
+      <div style={{ height: 6, background: C.dim, borderRadius: 3, overflow: "hidden" }}>
+        <div style={{ width: `${pct}%`, height: "100%", background: col, borderRadius: 3, transition: "width .5s" }} />
+      </div>
+      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+        <span style={{ fontSize: 9, color: C.muted, marginTop: 2 }}>seuil min: 60%</span>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+// REGIME BADGE
+// ══════════════════════════════════════════════════════════════
+function RegimeBadge({ regime }) {
+  const map = { TREND_UP: [C.bull, "▲ TREND UP"], TREND_DOWN: [C.bear, "▼ TREND DOWN"], RANGE: [C.gold, "↔ RANGE"] };
+  const [col, label] = map[regime] || [C.muted, "—"];
+  return (
+    <span style={{ background: col + "1a", border: `1px solid ${col}44`, color: col, padding: "3px 10px", borderRadius: 4, fontSize: 11, fontWeight: 700, letterSpacing: 1 }}>
+      {label}
+    </span>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+// PIPELINE VISUALISER  (ANALYSER→CONFIRMER→ENTRER→GÉRER→SORTIR)
+// ══════════════════════════════════════════════════════════════
+const PIPELINE = ["ANALYSER", "CONFIRMER", "ENTRER", "GÉRER", "SORTIR"];
+function Pipeline({ step }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 0, marginBottom: 16 }}>
+      {PIPELINE.map((s, i) => {
+        const done = i <= step, active = i === step;
+        return (
+          <div key={i} style={{ display: "flex", alignItems: "center", flex: 1 }}>
+            <div style={{
+              flex: "none", width: 28, height: 28, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 10, fontWeight: 700,
+              background: done ? (active ? C.gold : C.bull + "33") : C.dim,
+              border: `1.5px solid ${done ? (active ? C.gold : C.bull) : C.border}`,
+              color: done ? (active ? C.bg : C.bull) : C.muted,
+              boxShadow: active ? `0 0 14px ${C.gold}66` : "none",
+              transition: "all .3s", fontSize: 9
+            }}>{i + 1}</div>
+            <div style={{ flex: 1, textAlign: "center", fontSize: 8, color: active ? C.gold : done ? C.bull : C.muted, transition: "color .3s", letterSpacing: .5 }}>{s}</div>
+            {i < PIPELINE.length - 1 && <div style={{ width: 2, height: 2, borderRadius: "50%", background: i < step ? C.bull : C.border }} />}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+// MAIN APP
+// ══════════════════════════════════════════════════════════════
+export default function AIBot() {
+  const [candles, setCandles] = useState([]);
+  const [bot, setBot] = useState(null);
+  const [portfolio, setPortfolio] = useState({ balance: 10000, trades: [], history: [] });
+  const [tab, setTab] = useState("cockpit");
+  const [autoMode, setAutoMode] = useState(false);
+  const [log, setLog] = useState([]);
+  const [aiText, setAiText] = useState("");
+  const [aiLoad, setAiLoad] = useState(false);
+  const [modelTrained, setModelTrained] = useState(false);
+  const [training, setTraining] = useState(false);
+  const [tick, setTick] = useState(0);
+
+  const addLog = useCallback((msg, type = "info") => {
+    setLog(p => [{ msg, type, t: new Date().toLocaleTimeString() }, ...p.slice(0, 99)]);
+  }, []);
+
+  // Init
+  useEffect(() => {
+    const c = genCandles(200);
+    setCandles(c);
+    const b = runBot(c, 10000);
+    setBot(b);
+    addLog("AI Bot XAUUSD initialisé — 200 bougies M1 chargées", "success");
+    addLog("Architecture: Regime → XGBoost → Scalping → Fusion → Exécution", "info");
+    addLog("Session filter: Londres + New York (UTC 07h-20h)", "info");
+  }, []);
+
+  // Live tick
+  useEffect(() => {
+    const id = setInterval(() => {
+      setCandles(prev => {
+        if (!prev.length) return prev;
+        const last = prev[prev.length - 1];
+        const v = last.c * 0.0012;
+        const nc = last.c + (Math.random() - .5) * v;
+        const upd = [...prev.slice(1), { ...last, c: nc, h: Math.max(last.h, nc), l: Math.min(last.l, nc), t: Date.now() }];
+        const b = runBot(upd, portfolio.balance);
+        setBot(b);
+        setTick(t => t + 1);
+        if (autoMode && modelTrained) {
+          if (b.finalSignal !== "NO_TRADE" && b.inSession) {
+            setPortfolio(pf => {
+              const already = pf.trades.find(t => t.symbol === SYMBOL);
+              if (already) return pf;
+              const trade = { id: Date.now(), symbol: SYMBOL, type: b.finalSignal, entry: b.price, sl: b.sl, tp: b.tp, lot: b.lot, regime: b.regime, confidence: b.confidence, time: new Date().toLocaleTimeString() };
+              addLog(`AUTO EXECUTE ${b.finalSignal} XAUUSD @ ${b.price.toFixed(2)} | conf:${(b.confidence * 100).toFixed(0)}%`, "success");
+              return { ...pf, trades: [...pf.trades, trade] };
+            });
+          }
+        }
+        return upd;
+      });
+    }, 1800);
+    return () => clearInterval(id);
+  }, [autoMode, modelTrained, portfolio.balance, addLog]);
+
+  const trainModel = () => {
+    setTraining(true);
+    addLog("XGBoost training: 300 estimators, max_depth=6, lr=0.05...", "info");
+    setTimeout(() => {
+      setModelTrained(true);
+      setTraining(false);
+      addLog("✓ Modèle XGBoost entraîné — Classes: SELL(0) / NO_TRADE(1) / BUY(2)", "success");
+      addLog("Features: return, ema20, ema50, atr | eval_metric: mlogloss", "info");
+    }, 2200);
+  };
+
+  const execTrade = () => {
+    if (!bot || bot.finalSignal === "NO_TRADE") return;
+    const trade = { id: Date.now(), symbol: SYMBOL, type: bot.finalSignal, entry: bot.price, sl: bot.sl, tp: bot.tp, lot: bot.lot, regime: bot.regime, confidence: bot.confidence, time: new Date().toLocaleTimeString() };
+    setPortfolio(pf => ({ ...pf, trades: [...pf.trades, trade] }));
+    addLog(`MT5 ORDER ${bot.finalSignal} ${SYMBOL} @ ${bot.price.toFixed(2)} lot:${bot.lot} SL:${bot.sl?.toFixed(2)} TP:${bot.tp?.toFixed(2)}`, "success");
+  };
+
+  const closeTrade = id => {
+    setPortfolio(pf => {
+      const tr = pf.trades.find(t => t.id === id); if (!tr) return pf;
+      const ep = candles[candles.length - 1]?.c || tr.entry;
+      const pnl = tr.type.includes("BUY") ? (ep - tr.entry) * tr.lot * 100 : (tr.entry - ep) * tr.lot * 100;
+      addLog(`FERMETURE ${tr.symbol} ${tr.type} → ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}$`, pnl >= 0 ? "success" : "danger");
+      return { ...pf, balance: pf.balance + pnl, trades: pf.trades.filter(t => t.id !== id), history: [...pf.history, { ...tr, ep, pnl, ct: new Date().toLocaleTimeString() }] };
+    });
+  };
+
+  const getAI = async () => {
+    if (!bot) return;
+    setAiLoad(true);
+    const prompt = `Tu es un expert en trading algorithmique XAUUSD. Analyse ce setup:
+- Régime: ${bot.regime}
+- Signal XGBoost: ${bot.prediction === 1 ? "BUY" : bot.prediction === -1 ? "SELL" : "NEUTRAL"} (confiance: ${(bot.confidence * 100).toFixed(1)}%)
+- Sweep de liquidité: ${bot.sweep}
+- Signal scalping: ${bot.scalp}
+- Signal AI fusion: ${bot.aiSignal}
+- Signal final: ${bot.finalSignal}
+- ATR: ${bot.atr?.toFixed(2)}
+- Session active: ${bot.inSession ? "Oui" : "Non (hors session)"}
+Analyse en 4 lignes: qualité du setup, cohérence régime/signal, niveaux ATR, recommandation.`;
+    try {
+      const r = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, messages: [{ role: "user", content: prompt }] }) });
+      const d = await r.json();
+      setAiText(d.content?.[0]?.text || "Analyse indisponible");
+    } catch { setAiText("Erreur API."); }
+    setAiLoad(false);
+  };
+
+  const pipelineStep = bot ? (
+    bot.finalSignal !== "NO_TRADE" ? 4 :
+    bot.aiSignal !== "NO_TRADE" ? 3 :
+    (bot.sweep !== "NO_SWEEP" || bot.scalp !== "NO_TRADE") ? 2 :
+    bot.regime !== "RANGE" ? 1 : 0
+  ) : 0;
+
+  const price = candles.length ? candles[candles.length - 1].c : BASE_GOLD;
+  const totalPnl = portfolio.history.reduce((s, t) => s + t.pnl, 0);
+  const winRate = portfolio.history.length ? (portfolio.history.filter(t => t.pnl > 0).length / portfolio.history.length * 100).toFixed(0) : "—";
+
+  const css = {
+    app: { minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "'Fira Code','Courier New',monospace", fontSize: 13 },
+    hdr: { background: C.surface, borderBottom: `1px solid ${C.border}`, padding: "12px 24px", display: "flex", alignItems: "center", justifyContent: "space-between" },
+    nav: { display: "flex", background: C.surface, borderBottom: `1px solid ${C.border}`, padding: "0 24px" },
+    nb: a => ({ padding: "10px 20px", background: "none", border: "none", color: a ? C.gold : C.muted, cursor: "pointer", borderBottom: a ? `2px solid ${C.gold}` : "2px solid transparent", fontSize: 11, fontFamily: "inherit", letterSpacing: 2 }),
+    body: { display: "grid", gridTemplateColumns: "1fr 300px", gap: 0, height: "calc(100vh - 90px)" },
+    main: { padding: 20, overflowY: "auto" },
+    side: { background: C.surface, borderLeft: `1px solid ${C.border}`, overflowY: "auto", padding: 14 },
+    card: (accent) => ({ background: C.panel, border: `1px solid ${accent || C.border}`, borderRadius: 7, padding: 16, marginBottom: 14 }),
+    row: { display: "flex", gap: 10, marginBottom: 12 },
+    stat: col => ({ flex: 1, background: C.surface, border: `1px solid ${C.border}`, borderTop: `2px solid ${col || C.border}`, borderRadius: 5, padding: "10px 13px" }),
+    sl: { fontSize: 10, color: C.muted, marginBottom: 3, letterSpacing: 1 },
+    sv: col => ({ fontSize: 15, fontWeight: 700, color: col || C.text }),
+    btn: col => ({ background: col + "1a", border: `1px solid ${col}55`, color: col, padding: "8px 18px", borderRadius: 5, cursor: "pointer", fontSize: 11, fontFamily: "inherit", letterSpacing: 2 }),
+    tag: (col) => ({ background: col + "18", border: `1px solid ${col}44`, color: col, padding: "2px 8px", borderRadius: 3, fontSize: 10, fontWeight: 700 }),
+    logL: t => ({ padding: "4px 0", borderBottom: `1px solid ${C.dim}`, fontSize: 11, color: t === "success" ? C.bull : t === "danger" ? C.bear : C.muted }),
+  };
+
+  return (
+    <div style={css.app}>
+      <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;700&display=swap" rel="stylesheet" />
+      <style>{`*{box-sizing:border-box}::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:#172030}@keyframes glow{0%,100%{opacity:1}50%{opacity:.5}}@keyframes spin{to{transform:rotate(360deg)}}@keyframes fadeUp{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}`}</style>
+
+      {/* HEADER */}
+      <div style={css.hdr}>
+        <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+          <div style={{ fontSize: 20, fontWeight: 900, letterSpacing: 4, background: `linear-gradient(135deg,${C.gold},${C.orange})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
+            XAUUSD AI
+          </div>
+          <div style={{ fontSize: 10, color: C.muted, letterSpacing: 1 }}>Regime + XGBoost + Scalping + MT5</div>
+          <div style={{ ...css.tag(C.bull), animation: "glow 2s infinite" }}>● LIVE M1</div>
+          {bot?.inSession
+            ? <div style={css.tag(C.bull)}>✓ SESSION ACTIVE</div>
+            : <div style={css.tag(C.bear)}>✗ HORS SESSION</div>}
+        </div>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <span style={{ color: C.muted, fontSize: 11 }}>GOLD</span>
+          <span style={{ color: C.gold, fontWeight: 700, fontSize: 15 }}>${price.toFixed(2)}</span>
+          <span style={{ color: C.muted, fontSize: 11, marginLeft: 8 }}>BAL</span>
+          <span style={{ color: C.bull, fontWeight: 700 }}>${portfolio.balance.toFixed(2)}</span>
+          <button style={css.btn(!modelTrained ? C.orange : training ? C.muted : C.purple)} onClick={trainModel} disabled={modelTrained || training}>
+            {training ? "⏳ TRAINING..." : modelTrained ? "✓ XGB TRAINED" : "⚡ TRAIN MODEL"}
+          </button>
+          <button style={css.btn(autoMode ? C.bull : C.bear)} onClick={() => { setAutoMode(!autoMode); addLog(autoMode ? "AutoMode OFF" : "AutoMode ON — Bot autonome activé ⚡", autoMode ? "danger" : "success"); }}>
+            {autoMode ? "⚡ AUTO ON" : "⏸ AUTO OFF"}
+          </button>
+        </div>
+      </div>
+
+      {/* NAV */}
+      <div style={css.nav}>
+        {[["cockpit", "🎛 COCKPIT"], ["chart", "📊 CHART"], ["model", "🤖 MODÈLE IA"], ["portfolio", "💼 PORTFOLIO"], ["mt5", "🔌 MT5"]].map(([id, l]) => (
+          <button key={id} style={css.nb(tab === id)} onClick={() => setTab(id)}>{l}</button>
+        ))}
+      </div>
+
+      {/* COCKPIT */}
+      {tab === "cockpit" && (
+        <div style={css.body}>
+          <div style={css.main}>
+            {/* Pipeline */}
+            <div style={css.card()}>
+              <div style={{ fontSize: 10, color: C.muted, letterSpacing: 2, marginBottom: 12 }}>PIPELINE — ANALYSER → CONFIRMER → ENTRER → GÉRER → SORTIR</div>
+              <Pipeline step={pipelineStep} />
+            </div>
+
+            {/* Regime + Key stats */}
+            <div style={css.row}>
+              <div style={css.stat(bot?.regime === "TREND_UP" ? C.bull : bot?.regime === "TREND_DOWN" ? C.bear : C.gold)}>
+                <div style={css.sl}>RÉGIME MARCHÉ</div>
+                {bot && <RegimeBadge regime={bot.regime} />}
+              </div>
+              <div style={css.stat(C.blue)}><div style={css.sl}>PRIX XAUUSD</div><div style={css.sv(C.gold)}>${price.toFixed(2)}</div></div>
+              <div style={css.stat(C.orange)}><div style={css.sl}>ATR (14)</div><div style={css.sv(C.orange)}>{bot?.atr?.toFixed(2) || "—"}</div></div>
+              <div style={css.stat(C.purple)}><div style={css.sl}>RISQUE</div><div style={css.sv(C.purple)}>{bot ? (bot.risk * 100).toFixed(1) + "%" : "—"}</div></div>
+            </div>
+
+            {/* Layer indicators */}
+            <div style={css.card()}>
+              <div style={{ fontSize: 10, color: C.muted, letterSpacing: 2, marginBottom: 12 }}>COUCHES D'ANALYSE</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                {[
+                  ["1. SWEEP LIQUIDITÉ", bot?.sweep, bot?.sweep !== "NO_SWEEP" ? C.bull : C.muted],
+                  ["2. MOMENTUM (corps >60%)", momentumConfirmation(candles.slice(-5)) ? "✓ FORT" : "✗ FAIBLE", momentumConfirmation(candles.slice(-5)) ? C.bull : C.muted],
+                  ["3. SIGNAL SCALPING", bot?.scalp, bot?.scalp !== "NO_TRADE" ? C.gold : C.muted],
+                  ["4. SIGNAL AI FUSION", bot?.aiSignal, bot?.aiSignal !== "NO_TRADE" ? C.blue : C.muted],
+                  ["5. PRÉDICTION XGBOOST", bot?.prediction === 1 ? "BUY" : bot?.prediction === -1 ? "SELL" : "NEUTRAL", bot?.prediction !== 0 ? C.purple : C.muted],
+                  ["6. SIGNAL FINAL", bot?.finalSignal, bot?.finalSignal !== "NO_TRADE" ? (bot?.finalSignal.includes("BUY") ? C.bull : C.bear) : C.muted],
+                ].map(([label, val, col]) => (
+                  <div key={label} style={{ background: C.surface, border: `1px solid ${C.border}`, borderLeft: `3px solid ${col}`, borderRadius: 5, padding: "9px 12px" }}>
+                    <div style={{ fontSize: 10, color: C.muted, marginBottom: 3 }}>{label}</div>
+                    <div style={{ fontWeight: 700, color: col, fontSize: 12 }}>{val || "—"}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Confidence */}
+            <div style={css.card()}>
+              <ConfidenceMeter value={bot?.confidence || 0} />
+            </div>
+
+            {/* Trade execution */}
+            {bot?.finalSignal !== "NO_TRADE" ? (
+              <div style={css.card(bot?.finalSignal.includes("BUY") ? C.bull + "55" : C.bear + "55")}>
+                <div style={{ fontSize: 10, color: C.muted, letterSpacing: 2, marginBottom: 12 }}>
+                  ✓ SETUP VALIDÉ — {bot.finalSignal} | lot:{bot.lot} | risk:{(bot.risk * 100).toFixed(1)}%
+                </div>
+                <div style={css.row}>
+                  {[["ENTRÉE", bot.price?.toFixed(2), C.text], ["STOP LOSS", bot.sl?.toFixed(2), C.bear], ["TAKE PROFIT", bot.tp?.toFixed(2), C.bull], ["LOT SIZE", bot.lot, C.orange]].map(([k, v, col]) => (
+                    <div key={k} style={css.stat(col)}><div style={css.sl}>{k}</div><div style={css.sv(col)}>{v}</div></div>
+                  ))}
+                </div>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <button style={css.btn(bot.finalSignal.includes("BUY") ? C.bull : C.bear)} onClick={execTrade} disabled={!modelTrained}>
+                    {modelTrained ? `▶ MT5: ${bot.finalSignal} XAUUSD` : "⚠ ENTRAÎNER LE MODÈLE D'ABORD"}
+                  </button>
+                  {!modelTrained && <span style={{ color: C.muted, fontSize: 10, alignSelf: "center" }}>Train XGBoost requis</span>}
+                </div>
+              </div>
+            ) : (
+              <div style={{ ...css.card(), textAlign: "center", padding: 28 }}>
+                <div style={{ color: C.muted, letterSpacing: 2, fontSize: 12 }}>⏳ EN ATTENTE D'UN SETUP VALIDE</div>
+                <div style={{ color: C.dim, fontSize: 10, marginTop: 6 }}>Conditions: Session active + Sweep + Momentum + Régime + Confiance ≥60%</div>
+              </div>
+            )}
+          </div>
+
+          {/* Side log */}
+          <div style={css.side}>
+            <div style={{ fontSize: 10, color: C.muted, letterSpacing: 2, marginBottom: 10, borderBottom: `1px solid ${C.border}`, paddingBottom: 8 }}>CONSOLE BOT</div>
+            {log.map((l, i) => (
+              <div key={i} style={css.logL(l.type)}>
+                <div style={{ color: C.dim, fontSize: 9 }}>{l.t}</div>
+                <div>{l.msg}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* CHART TAB */}
+      {tab === "chart" && (
+        <div style={{ padding: 20 }}>
+          <div style={css.card()}>
+            <div style={{ fontSize: 10, color: C.muted, letterSpacing: 2, marginBottom: 10 }}>XAUUSD — M1 | EMA20 / EMA50 | SL / TP</div>
+            <GoldChart candles={candles} bot={bot} />
+          </div>
+          <div style={css.row}>
+            {[
+              ["RÉGIME", bot?.regime, bot?.regime === "TREND_UP" ? C.bull : bot?.regime === "TREND_DOWN" ? C.bear : C.gold],
+              ["SWEEP", bot?.sweep, bot?.sweep !== "NO_SWEEP" ? C.bull : C.muted],
+              ["SCALPING", bot?.scalp, bot?.scalp !== "NO_TRADE" ? C.gold : C.muted],
+              ["AI SIGNAL", bot?.aiSignal, bot?.aiSignal !== "NO_TRADE" ? C.blue : C.muted],
+              ["FINAL", bot?.finalSignal, bot?.finalSignal !== "NO_TRADE" ? C.bull : C.muted],
+            ].map(([k, v, col]) => (
+              <div key={k} style={css.stat(col)}><div style={css.sl}>{k}</div><div style={css.sv(col)}>{v || "—"}</div></div>
+            ))}
+          </div>
+          {/* Volume bars */}
+          <div style={css.card()}>
+            <div style={{ fontSize: 10, color: C.muted, letterSpacing: 2, marginBottom: 8 }}>VOLUME (dernières 40 bougies)</div>
+            <svg viewBox="0 0 640 60" style={{ width: "100%", height: 60 }}>
+              {candles.slice(-40).map((c, i) => {
+                const maxV = Math.max(...candles.slice(-40).map(x => x.vol));
+                const h = (c.vol / maxV) * 55;
+                return <rect key={i} x={i * 16} y={60 - h} width={13} height={h} fill={c.c >= c.o ? C.bull : C.bear} opacity=".6" />;
+              })}
+            </svg>
+          </div>
+        </div>
+      )}
+
+      {/* MODEL TAB */}
+      {tab === "model" && (
+        <div style={{ padding: 20 }}>
+          <div style={css.card(C.purple)}>
+            <div style={{ fontSize: 10, color: C.muted, letterSpacing: 2, marginBottom: 14 }}>XGBOOST SIGNAL MODEL — ARCHITECTURE</div>
+            {[
+              ["Algorithme", "XGBClassifier (multi:softprob)"],
+              ["N estimateurs", "300"],
+              ["Max depth", "6"],
+              ["Learning rate", "0.05"],
+              ["Subsample", "0.8"],
+              ["Colsample_bytree", "0.8"],
+              ["Classes", "0=SELL / 1=NO_TRADE / 2=BUY"],
+              ["Eval metric", "mlogloss"],
+              ["Features", "return, ema20, ema50, atr"],
+              ["Statut", modelTrained ? "✓ ENTRAÎNÉ" : "✗ PAS ENCORE ENTRAÎNÉ"],
+            ].map(([k, v]) => (
+              <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "7px 0", borderBottom: `1px solid ${C.dim}`, fontSize: 12 }}>
+                <span style={{ color: C.muted }}>{k}</span>
+                <span style={{ color: k === "Statut" ? (modelTrained ? C.bull : C.bear) : C.text }}>{v}</span>
+              </div>
+            ))}
+            <div style={{ marginTop: 14, display: "flex", gap: 10 }}>
+              <button style={css.btn(C.purple)} onClick={trainModel} disabled={modelTrained || training}>
+                {training ? "⏳ ENTRAÎNEMENT..." : modelTrained ? "✓ MODÈLE PRÊT" : "⚡ ENTRAÎNER XGBoost"}
+              </button>
+            </div>
+          </div>
+          {bot && (
+            <div style={css.card()}>
+              <div style={{ fontSize: 10, color: C.muted, letterSpacing: 2, marginBottom: 12 }}>DERNIÈRE PRÉDICTION</div>
+              <ConfidenceMeter value={bot.confidence} />
+              <div style={{ marginTop: 12, display: "flex", gap: 10 }}>
+                <div style={css.stat(C.purple)}><div style={css.sl}>PRÉDICTION</div><div style={css.sv(bot.prediction === 1 ? C.bull : bot.prediction === -1 ? C.bear : C.muted)}>{bot.prediction === 1 ? "BUY (2)" : bot.prediction === -1 ? "SELL (0)" : "NO_TRADE (1)"}</div></div>
+                <div style={css.stat(C.gold)}><div style={css.sl}>CONFIANCE</div><div style={css.sv(bot.confidence >= .6 ? C.bull : C.bear)}>{(bot.confidence * 100).toFixed(1)}%</div></div>
+                <div style={css.stat(C.blue)}><div style={css.sl}>SEUIL MIN</div><div style={css.sv(C.muted)}>60.0%</div></div>
+              </div>
+            </div>
+          )}
+          <div style={css.card()}>
+            <div style={{ fontSize: 10, color: C.muted, letterSpacing: 2, marginBottom: 12 }}>ANALYSE IA DU SETUP</div>
+            <button style={css.btn(C.blue)} onClick={getAI} disabled={aiLoad}>{aiLoad ? "⏳ ANALYSE..." : "🤖 ANALYSER AVEC CLAUDE"}</button>
+            {aiText && <div style={{ marginTop: 12, color: C.text, lineHeight: 1.8, fontSize: 12, animation: "fadeUp .4s" }}>{aiText}</div>}
+          </div>
+        </div>
+      )}
+
+      {/* PORTFOLIO */}
+      {tab === "portfolio" && (
+        <div style={{ padding: 20 }}>
+          <div style={css.row}>
+            {[
+              ["SOLDE", "$" + portfolio.balance.toFixed(2), C.gold],
+              ["POSITIONS", portfolio.trades.length, C.blue],
+              ["TRADES FERMÉS", portfolio.history.length, C.muted],
+              ["P&L TOTAL", (totalPnl >= 0 ? "+" : "") + "$" + totalPnl.toFixed(2), totalPnl >= 0 ? C.bull : C.bear],
+              ["WIN RATE", winRate + "%", C.purple],
+            ].map(([k, v, col]) => (
+              <div key={k} style={css.stat(col)}><div style={css.sl}>{k}</div><div style={css.sv(col)}>{v}</div></div>
+            ))}
+          </div>
+          <div style={css.card()}>
+            <div style={{ fontSize: 10, color: C.muted, letterSpacing: 2, marginBottom: 10 }}>POSITIONS OUVERTES</div>
+            {portfolio.trades.length === 0 ? <div style={{ color: C.muted }}>Aucune position ouverte</div> : (
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                <thead><tr style={{ color: C.muted }}>{["SYMBOLE", "TYPE", "ENTRÉE", "SL", "TP", "LOT", "RÉGIME", "CONF", ""].map(h => <th key={h} style={{ textAlign: "left", padding: "5px 8px", borderBottom: `1px solid ${C.border}` }}>{h}</th>)}</tr></thead>
+                <tbody>{portfolio.trades.map(t => (
+                  <tr key={t.id} style={{ borderBottom: `1px solid ${C.dim}` }}>
+                    <td style={{ padding: "5px 8px", color: C.gold }}>{t.symbol}</td>
+                    <td style={{ padding: "5px 8px", color: t.type.includes("BUY") ? C.bull : C.bear }}>{t.type}</td>
+                    <td style={{ padding: "5px 8px" }}>{t.entry?.toFixed(2)}</td>
+                    <td style={{ padding: "5px 8px", color: C.bear }}>{t.sl?.toFixed(2)}</td>
+                    <td style={{ padding: "5px 8px", color: C.bull }}>{t.tp?.toFixed(2)}</td>
+                    <td style={{ padding: "5px 8px" }}>{t.lot}</td>
+                    <td style={{ padding: "5px 8px", fontSize: 10 }}><span style={css.tag(t.regime === "TREND_UP" ? C.bull : t.regime === "TREND_DOWN" ? C.bear : C.gold)}>{t.regime}</span></td>
+                    <td style={{ padding: "5px 8px", color: C.purple }}>{(t.confidence * 100).toFixed(0)}%</td>
+                    <td style={{ padding: "5px 8px" }}><button style={{ ...css.btn(C.bear), padding: "3px 8px" }} onClick={() => closeTrade(t.id)}>FERMER</button></td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            )}
+          </div>
+          <div style={css.card()}>
+            <div style={{ fontSize: 10, color: C.muted, letterSpacing: 2, marginBottom: 10 }}>HISTORIQUE</div>
+            {portfolio.history.length === 0 ? <div style={{ color: C.muted }}>Aucun trade fermé</div> : (
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                <thead><tr style={{ color: C.muted }}>{["SYMBOLE", "TYPE", "ENTRÉE", "SORTIE", "P&L", "HEURE"].map(h => <th key={h} style={{ textAlign: "left", padding: "5px 8px", borderBottom: `1px solid ${C.border}` }}>{h}</th>)}</tr></thead>
+                <tbody>{portfolio.history.map((t, i) => (
+                  <tr key={i} style={{ borderBottom: `1px solid ${C.dim}` }}>
+                    <td style={{ padding: "5px 8px", color: C.gold }}>{t.symbol}</td>
+                    <td style={{ padding: "5px 8px", color: t.type.includes("BUY") ? C.bull : C.bear }}>{t.type}</td>
+                    <td style={{ padding: "5px 8px" }}>{t.entry?.toFixed(2)}</td>
+                    <td style={{ padding: "5px 8px" }}>{t.ep?.toFixed(2)}</td>
+                    <td style={{ padding: "5px 8px", color: t.pnl >= 0 ? C.bull : C.bear, fontWeight: 700 }}>{t.pnl >= 0 ? "+" : ""}{t.pnl?.toFixed(2)}$</td>
+                    <td style={{ padding: "5px 8px", color: C.muted }}>{t.ct}</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* MT5 TAB */}
+      {tab === "mt5" && (
+        <div style={{ padding: 20 }}>
+          <div style={css.card(C.blue)}>
+            <div style={{ fontSize: 10, color: C.muted, letterSpacing: 2, marginBottom: 14 }}>MT5 EXECUTION LAYER — PARAMÈTRES</div>
+            {[
+              ["SYMBOL", "XAUUSD"],
+              ["TIMEFRAME", "TIMEFRAME_M1"],
+              ["MAGIC NUMBER", "123456"],
+              ["DEVIATION", "20 points"],
+              ["ORDER TYPE", "ORDER_FILLING_IOC"],
+              ["ORDER TIME", "ORDER_TIME_GTC"],
+              ["SESSION FILTER", "UTC 07h-20h (Londres + NY)"],
+              ["LOOP DELAY", "10s (M1 scalping)"],
+              ["LOT SIZING", "balance × risk / 1000"],
+            ].map(([k, v]) => (
+              <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "7px 0", borderBottom: `1px solid ${C.dim}`, fontSize: 12 }}>
+                <span style={{ color: C.muted }}>{k}</span><span style={{ color: C.blue }}>{v}</span>
+              </div>
+            ))}
+          </div>
+          <div style={css.card()}>
+            <div style={{ fontSize: 10, color: C.muted, letterSpacing: 2, marginBottom: 12 }}>ORDRE SIMULÉ (dernier setup)</div>
+            {bot?.finalSignal !== "NO_TRADE" ? (
+              <div style={{ fontFamily: "monospace", fontSize: 11, color: C.text, lineHeight: 2, background: C.surface, padding: 14, borderRadius: 5, border: `1px solid ${C.border}` }}>
+                <div style={{ color: C.gold }}>order = {'{'}</div>
+                <div>&nbsp;&nbsp;"action": <span style={{ color: C.bull }}>TRADE_ACTION_DEAL</span>,</div>
+                <div>&nbsp;&nbsp;"symbol": <span style={{ color: C.gold }}>"XAUUSD"</span>,</div>
+                <div>&nbsp;&nbsp;"volume": <span style={{ color: C.orange }}>{bot.lot}</span>,</div>
+                <div>&nbsp;&nbsp;"type": <span style={{ color: bot.finalSignal.includes("BUY") ? C.bull : C.bear }}>ORDER_TYPE_{bot.finalSignal.includes("BUY") ? "BUY" : "SELL"}</span>,</div>
+                <div>&nbsp;&nbsp;"price": <span style={{ color: C.text }}>{bot.price?.toFixed(2)}</span>,</div>
+                <div>&nbsp;&nbsp;"sl": <span style={{ color: C.bear }}>{bot.sl?.toFixed(2)}</span>,</div>
+                <div>&nbsp;&nbsp;"tp": <span style={{ color: C.bull }}>{bot.tp?.toFixed(2)}</span>,</div>
+                <div>&nbsp;&nbsp;"magic": <span style={{ color: C.purple }}>123456</span>,</div>
+                <div>&nbsp;&nbsp;"comment": <span style={{ color: C.gold }}>"AI Bot {bot.finalSignal}"</span></div>
+                <div style={{ color: C.gold }}>{'}'}</div>
+              </div>
+            ) : (
+              <div style={{ color: C.muted, fontSize: 12 }}>Aucun setup actif — ordre non généré</div>
+            )}
+          </div>
+          <div style={css.card()}>
+            <div style={{ fontSize: 10, color: C.muted, letterSpacing: 2, marginBottom: 10 }}>AUTONOMOUS BOT LOOP</div>
+            <div style={{ fontFamily: "monospace", fontSize: 11, color: C.muted, lineHeight: 2 }}>
+              <div><span style={{ color: C.purple }}>while</span> ACTIVE:</div>
+              <div>&nbsp;&nbsp;df = get_data() <span style={{ color: C.dim }}># MT5 candles</span></div>
+              <div>&nbsp;&nbsp;regime = detect_regime(df)</div>
+              <div>&nbsp;&nbsp;X = create_features(df)</div>
+              <div>&nbsp;&nbsp;pred, conf = model.predict(X)</div>
+              <div>&nbsp;&nbsp;scalp = scalping_signal(df, regime)</div>
+              <div>&nbsp;&nbsp;ai_sig = generate_signal(regime, pred, conf)</div>
+              <div>&nbsp;&nbsp;<span style={{ color: C.gold }}>if</span> scalp != NO_TRADE <span style={{ color: C.gold }}>and</span> ai_sig != NO_TRADE:</div>
+              <div>&nbsp;&nbsp;&nbsp;&nbsp;execute_trade(scalp, risk) <span style={{ color: C.bull }}>✓</span></div>
+              <div>&nbsp;&nbsp;time.sleep(10)</div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

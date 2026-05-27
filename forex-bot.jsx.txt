@@ -1,0 +1,658 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ── Simulated price data generator ──────────────────────────────────────────
+const PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CHF", "NZD/USD"];
+const BASE_PRICES = { "EUR/USD": 1.0851, "GBP/USD": 1.2734, "USD/JPY": 149.82, "AUD/USD": 0.6512, "USD/CHF": 0.9043, "NZD/USD": 0.5987 };
+
+function generateCandles(pair, count = 80) {
+  let price = BASE_PRICES[pair];
+  const candles = [];
+  const now = Date.now();
+  for (let i = count; i >= 0; i--) {
+    const vol = price * 0.0015;
+    const open = price + (Math.random() - 0.5) * vol;
+    const close = open + (Math.random() - 0.5) * vol * 1.5;
+    const high = Math.max(open, close) + Math.random() * vol * 0.5;
+    const low = Math.min(open, close) - Math.random() * vol * 0.5;
+    candles.push({ time: now - i * 900000, open, high, low, close, volume: Math.random() * 1000 + 200 });
+    price = close;
+  }
+  return candles;
+}
+
+function calcEMA(data, period) {
+  const k = 2 / (period + 1);
+  const ema = [data[0]];
+  for (let i = 1; i < data.length; i++) ema.push(data[i] * k + ema[i - 1] * (1 - k));
+  return ema;
+}
+
+function calcRSI(closes, period = 14) {
+  const rsi = [];
+  for (let i = 0; i < closes.length; i++) {
+    if (i < period) { rsi.push(50); continue; }
+    let gains = 0, losses = 0;
+    for (let j = i - period + 1; j <= i; j++) {
+      const d = closes[j] - closes[j - 1];
+      if (d > 0) gains += d; else losses -= d;
+    }
+    const rs = gains / (losses || 0.0001);
+    rsi.push(100 - 100 / (1 + rs));
+  }
+  return rsi;
+}
+
+function calcMACD(closes) {
+  const ema12 = calcEMA(closes, 12);
+  const ema26 = calcEMA(closes, 26);
+  const macd = ema12.map((v, i) => v - ema26[i]);
+  const signal = calcEMA(macd, 9);
+  return { macd, signal, hist: macd.map((v, i) => v - signal[i]) };
+}
+
+function generateSignal(candles) {
+  const closes = candles.map(c => c.close);
+  const rsi = calcRSI(closes);
+  const { macd, signal } = calcMACD(closes);
+  const ema20 = calcEMA(closes, 20);
+  const ema50 = calcEMA(closes, 50);
+  const last = closes.length - 1;
+  let score = 0;
+  if (rsi[last] < 35) score += 2;
+  if (rsi[last] > 65) score -= 2;
+  if (macd[last] > signal[last] && macd[last - 1] <= signal[last - 1]) score += 3;
+  if (macd[last] < signal[last] && macd[last - 1] >= signal[last - 1]) score -= 3;
+  if (ema20[last] > ema50[last]) score += 1;
+  if (ema20[last] < ema50[last]) score -= 1;
+  const lastClose = closes[last];
+  const atr = candles.slice(-14).reduce((s, c) => s + (c.high - c.low), 0) / 14;
+  if (score >= 3) return { type: "BUY", strength: Math.min(score, 6), entry: lastClose, sl: lastClose - atr * 1.5, tp: lastClose + atr * 2.5, rsi: rsi[last], macd: macd[last] };
+  if (score <= -3) return { type: "SELL", strength: Math.min(-score, 6), entry: lastClose, sl: lastClose + atr * 1.5, tp: lastClose - atr * 2.5, rsi: rsi[last], macd: macd[last] };
+  return { type: "NEUTRAL", strength: 0, entry: lastClose, rsi: rsi[last], macd: macd[last] };
+}
+
+function runBacktest(pair, candles, strategyParams) {
+  const { rsiOversold = 35, rsiOverbought = 65, tpMultiplier = 2.5, slMultiplier = 1.5 } = strategyParams;
+  const closes = candles.map(c => c.close);
+  const rsi = calcRSI(closes);
+  const { macd, signal } = calcMACD(closes);
+  const ema20 = calcEMA(closes, 20);
+  const ema50 = calcEMA(closes, 50);
+  const trades = [];
+  let inTrade = null;
+  for (let i = 50; i < candles.length; i++) {
+    if (inTrade) {
+      const c = candles[i];
+      if (inTrade.type === "BUY") {
+        if (c.low <= inTrade.sl) { trades.push({ ...inTrade, exit: inTrade.sl, pnl: inTrade.sl - inTrade.entry, result: "SL", exitBar: i }); inTrade = null; }
+        else if (c.high >= inTrade.tp) { trades.push({ ...inTrade, exit: inTrade.tp, pnl: inTrade.tp - inTrade.entry, result: "TP", exitBar: i }); inTrade = null; }
+      } else {
+        if (c.high >= inTrade.sl) { trades.push({ ...inTrade, exit: inTrade.sl, pnl: inTrade.entry - inTrade.sl, result: "SL", exitBar: i }); inTrade = null; }
+        else if (c.low <= inTrade.tp) { trades.push({ ...inTrade, exit: inTrade.tp, pnl: inTrade.entry - inTrade.tp, result: "TP", exitBar: i }); inTrade = null; }
+      }
+    }
+    if (!inTrade) {
+      const atr = candles.slice(Math.max(0, i - 14), i).reduce((s, c2) => s + (c2.high - c2.low), 0) / 14;
+      let score = 0;
+      if (rsi[i] < rsiOversold) score += 2;
+      if (rsi[i] > rsiOverbought) score -= 2;
+      if (macd[i] > signal[i] && macd[i - 1] <= signal[i - 1]) score += 3;
+      if (macd[i] < signal[i] && macd[i - 1] >= signal[i - 1]) score -= 3;
+      if (ema20[i] > ema50[i]) score += 1;
+      if (ema20[i] < ema50[i]) score -= 1;
+      if (score >= 3) inTrade = { type: "BUY", entry: candles[i].close, sl: candles[i].close - atr * slMultiplier, tp: candles[i].close + atr * tpMultiplier, entryBar: i };
+      if (score <= -3) inTrade = { type: "SELL", entry: candles[i].close, sl: candles[i].close + atr * slMultiplier, tp: candles[i].close - atr * tpMultiplier, entryBar: i };
+    }
+  }
+  const wins = trades.filter(t => t.result === "TP").length;
+  const totalPnl = trades.reduce((s, t) => s + t.pnl, 0);
+  const winRate = trades.length ? (wins / trades.length) * 100 : 0;
+  return { trades, wins, losses: trades.length - wins, totalPnl, winRate, totalTrades: trades.length };
+}
+
+// ── Mini Chart ──────────────────────────────────────────────────────────────
+function MiniChart({ candles, signal, width = 220, height = 70 }) {
+  if (!candles || candles.length === 0) return null;
+  const recent = candles.slice(-40);
+  const closes = recent.map(c => c.close);
+  const min = Math.min(...closes);
+  const max = Math.max(...closes);
+  const range = max - min || 1;
+  const pts = closes.map((v, i) => {
+    const x = (i / (closes.length - 1)) * width;
+    const y = height - ((v - min) / range) * height;
+    return `${x},${y}`;
+  }).join(" ");
+  const color = signal.type === "BUY" ? "#00d4a0" : signal.type === "SELL" ? "#ff4d6d" : "#7b8fa6";
+  return (
+    <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", height }}>
+      <defs>
+        <linearGradient id={`g${signal.type}`} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={color} stopOpacity="0.3" />
+          <stop offset="100%" stopColor={color} stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+// ── Full Chart ───────────────────────────────────────────────────────────────
+function CandleChart({ candles, pair }) {
+  const W = 560, H = 200;
+  if (!candles || candles.length < 2) return null;
+  const recent = candles.slice(-50);
+  const closes = recent.map(c => c.close);
+  const ema20 = calcEMA(closes, 20);
+  const ema50 = calcEMA(closes, 50);
+  const allH = recent.map(c => c.high), allL = recent.map(c => c.low);
+  const minP = Math.min(...allL), maxP = Math.max(...allH);
+  const range = maxP - minP || 1;
+  const cw = W / recent.length;
+  const py = v => H - ((v - minP) / range) * (H - 10) - 5;
+  const px = i => i * cw + cw * 0.5;
+  const emaPath20 = ema20.map((v, i) => `${i === 0 ? "M" : "L"}${px(i)},${py(v)}`).join(" ");
+  const emaPath50 = ema50.map((v, i) => `${i === 0 ? "M" : "L"}${px(i)},${py(v)}`).join(" ");
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: H, display: "block" }}>
+      {recent.map((c, i) => {
+        const bull = c.close >= c.open;
+        const col = bull ? "#00d4a0" : "#ff4d6d";
+        const bx = px(i) - cw * 0.35;
+        const bw = cw * 0.7;
+        const by = py(Math.max(c.open, c.close));
+        const bh = Math.max(1, Math.abs(py(c.open) - py(c.close)));
+        return (
+          <g key={i}>
+            <line x1={px(i)} y1={py(c.high)} x2={px(i)} y2={py(c.low)} stroke={col} strokeWidth="0.8" />
+            <rect x={bx} y={by} width={bw} height={bh} fill={col} opacity="0.9" />
+          </g>
+        );
+      })}
+      <path d={emaPath20} fill="none" stroke="#f0c040" strokeWidth="1.2" opacity="0.8" />
+      <path d={emaPath50} fill="none" stroke="#a78bfa" strokeWidth="1.2" opacity="0.8" />
+      <text x="6" y="14" fill="#f0c040" fontSize="9" fontFamily="monospace">EMA20</text>
+      <text x="50" y="14" fill="#a78bfa" fontSize="9" fontFamily="monospace">EMA50</text>
+    </svg>
+  );
+}
+
+// ── RSI Chart ────────────────────────────────────────────────────────────────
+function RSIChart({ candles }) {
+  const W = 560, H = 70;
+  if (!candles || candles.length < 15) return null;
+  const recent = candles.slice(-50);
+  const closes = recent.map(c => c.close);
+  const rsi = calcRSI(closes);
+  const px = i => (i / (rsi.length - 1)) * W;
+  const py = v => H - (v / 100) * H;
+  const path = rsi.map((v, i) => `${i === 0 ? "M" : "L"}${px(i)},${py(v)}`).join(" ");
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: H, display: "block" }}>
+      <line x1="0" y1={py(70)} x2={W} y2={py(70)} stroke="#ff4d6d" strokeWidth="0.5" strokeDasharray="3,3" opacity="0.5" />
+      <line x1="0" y1={py(30)} x2={W} y2={py(30)} stroke="#00d4a0" strokeWidth="0.5" strokeDasharray="3,3" opacity="0.5" />
+      <path d={path} fill="none" stroke="#60a5fa" strokeWidth="1.5" />
+      <text x="4" y={py(70) - 3} fill="#ff4d6d" fontSize="8" fontFamily="monospace">70</text>
+      <text x="4" y={py(30) - 3} fill="#00d4a0" fontSize="8" fontFamily="monospace">30</text>
+    </svg>
+  );
+}
+
+// ── Main App ─────────────────────────────────────────────────────────────────
+export default function ForexBot() {
+  const [activePair, setActivePair] = useState("EUR/USD");
+  const [tab, setTab] = useState("dashboard");
+  const [allCandles, setAllCandles] = useState({});
+  const [signals, setSignals] = useState({});
+  const [portfolio, setPortfolio] = useState({ balance: 10000, equity: 10000, openTrades: [], closedTrades: [] });
+  const [btResult, setBtResult] = useState(null);
+  const [btParams, setBtParams] = useState({ rsiOversold: 35, rsiOverbought: 65, tpMultiplier: 2.5, slMultiplier: 1.5 });
+  const [btPair, setBtPair] = useState("EUR/USD");
+  const [isScanning, setIsScanning] = useState(false);
+  const [aiAnalysis, setAiAnalysis] = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
+  const [log, setLog] = useState([]);
+  const [autoTrade, setAutoTrade] = useState(false);
+  const intervalRef = useRef(null);
+  const addLog = useCallback((msg, type = "info") => {
+    setLog(prev => [{ msg, type, time: new Date().toLocaleTimeString() }, ...prev.slice(0, 49)]);
+  }, []);
+
+  useEffect(() => {
+    const data = {};
+    const sigs = {};
+    PAIRS.forEach(p => {
+      data[p] = generateCandles(p);
+      sigs[p] = generateSignal(data[p]);
+    });
+    setAllCandles(data);
+    setSignals(sigs);
+    addLog("Bot initialisé — 6 paires chargées", "success");
+  }, []);
+
+  // Live tick simulation
+  useEffect(() => {
+    intervalRef.current = setInterval(() => {
+      setAllCandles(prev => {
+        const updated = { ...prev };
+        const sigs = {};
+        PAIRS.forEach(p => {
+          if (!updated[p]) return;
+          const last = updated[p][updated[p].length - 1];
+          const vol = last.close * 0.0006;
+          const newClose = last.close + (Math.random() - 0.5) * vol;
+          const newCandles = [...updated[p].slice(1), {
+            ...last, close: newClose,
+            high: Math.max(last.high, newClose),
+            low: Math.min(last.low, newClose),
+            time: Date.now()
+          }];
+          updated[p] = newCandles;
+          sigs[p] = generateSignal(newCandles);
+        });
+        setSignals(sigs);
+        if (autoTrade) {
+          const sig = sigs[activePair];
+          if (sig && sig.type !== "NEUTRAL" && sig.strength >= 4) {
+            setPortfolio(pf => {
+              const already = pf.openTrades.find(t => t.pair === activePair);
+              if (already) return pf;
+              const lot = pf.balance * 0.02;
+              addLog(`AUTO-TRADE ${sig.type} ${activePair} @ ${sig.entry?.toFixed(5)}`, sig.type === "BUY" ? "success" : "danger");
+              return { ...pf, openTrades: [...pf.openTrades, { id: Date.now(), pair: activePair, type: sig.type, entry: sig.entry, sl: sig.sl, tp: sig.tp, lot, time: new Date().toLocaleTimeString() }] };
+            });
+          }
+        }
+        return updated;
+      });
+    }, 2000);
+    return () => clearInterval(intervalRef.current);
+  }, [autoTrade, activePair, addLog]);
+
+  const scanMarket = () => {
+    setIsScanning(true);
+    addLog("Scan du marché en cours...", "info");
+    setTimeout(() => {
+      setIsScanning(false);
+      const found = PAIRS.filter(p => signals[p]?.type !== "NEUTRAL");
+      addLog(`Scan terminé — ${found.length} opportunités détectées`, "success");
+    }, 1500);
+  };
+
+  const getAiAnalysis = async () => {
+    if (!allCandles[activePair]) return;
+    setAiLoading(true);
+    const sig = signals[activePair];
+    const candles = allCandles[activePair];
+    const closes = candles.map(c => c.close);
+    const rsi = calcRSI(closes);
+    const lastRsi = rsi[rsi.length - 1].toFixed(1);
+    const lastClose = closes[closes.length - 1];
+    const prompt = `Tu es un expert analyste Forex. Analyse brièvement la paire ${activePair} avec ces données:
+- Prix actuel: ${lastClose.toFixed(5)}
+- RSI(14): ${lastRsi}
+- Signal technique: ${sig?.type}
+- Force du signal: ${sig?.strength}/6
+Donne une analyse concise en 3-4 phrases: tendance, niveaux clés, recommandation. Reste factuel et professionnel.`;
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, messages: [{ role: "user", content: prompt }] })
+      });
+      const data = await res.json();
+      setAiAnalysis(data.content?.[0]?.text || "Analyse indisponible.");
+      addLog(`Analyse IA générée pour ${activePair}`, "success");
+    } catch {
+      setAiAnalysis("Erreur lors de l'analyse IA.");
+    }
+    setAiLoading(false);
+  };
+
+  const closeTrade = (id) => {
+    setPortfolio(pf => {
+      const trade = pf.openTrades.find(t => t.id === id);
+      if (!trade) return pf;
+      const exitPrice = allCandles[trade.pair]?.slice(-1)[0]?.close || trade.entry;
+      const pnl = trade.type === "BUY" ? (exitPrice - trade.entry) * trade.lot * 10000 : (trade.entry - exitPrice) * trade.lot * 10000;
+      addLog(`Clôture ${trade.pair} ${trade.type}: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}$`, pnl >= 0 ? "success" : "danger");
+      return {
+        ...pf,
+        balance: pf.balance + pnl,
+        equity: pf.equity + pnl,
+        openTrades: pf.openTrades.filter(t => t.id !== id),
+        closedTrades: [...pf.closedTrades, { ...trade, exitPrice, pnl, closeTime: new Date().toLocaleTimeString() }]
+      };
+    });
+  };
+
+  const doBacktest = () => {
+    if (!allCandles[btPair]) return;
+    const result = runBacktest(btPair, allCandles[btPair], btParams);
+    setBtResult(result);
+    addLog(`Backtest ${btPair}: ${result.totalTrades} trades, WR ${result.winRate.toFixed(1)}%`, "info");
+  };
+
+  const sig = signals[activePair];
+  const candles = allCandles[activePair] || [];
+  const currentPrice = candles.length ? candles[candles.length - 1].close : 0;
+
+  const s = {
+    app: { minHeight: "100vh", background: "#080d14", color: "#c8d6e5", fontFamily: "'IBM Plex Mono', 'Courier New', monospace", fontSize: 13 },
+    header: { background: "#0b1220", borderBottom: "1px solid #1a2840", padding: "12px 20px", display: "flex", alignItems: "center", justifyContent: "space-between" },
+    logo: { display: "flex", alignItems: "center", gap: 10 },
+    logoText: { fontSize: 17, fontWeight: 700, color: "#00d4a0", letterSpacing: 2 },
+    badge: (color) => ({ background: color + "22", border: `1px solid ${color}44`, color, padding: "2px 8px", borderRadius: 4, fontSize: 11 }),
+    nav: { display: "flex", gap: 4, background: "#0b1220", padding: "0 20px", borderBottom: "1px solid #1a2840" },
+    navBtn: (active) => ({ padding: "10px 16px", background: "none", border: "none", color: active ? "#00d4a0" : "#5a7a9a", cursor: "pointer", borderBottom: active ? "2px solid #00d4a0" : "2px solid transparent", fontSize: 12, fontFamily: "inherit", letterSpacing: 1 }),
+    grid: { display: "grid", gridTemplateColumns: "260px 1fr 220px", gap: 0, height: "calc(100vh - 90px)" },
+    panel: { background: "#0b1220", border: "1px solid #1a2840" },
+    panelTitle: { padding: "10px 14px", borderBottom: "1px solid #1a2840", color: "#7b9dc0", fontSize: 11, letterSpacing: 2, textTransform: "uppercase" },
+    pairRow: (active) => ({ padding: "10px 14px", cursor: "pointer", background: active ? "#0f1e30" : "none", borderLeft: active ? "2px solid #00d4a0" : "2px solid transparent", display: "flex", justifyContent: "space-between", alignItems: "center" }),
+    sigBadge: (type) => ({ padding: "2px 6px", borderRadius: 3, fontSize: 10, fontWeight: 700, background: type === "BUY" ? "#00d4a022" : type === "SELL" ? "#ff4d6d22" : "#1a2840", color: type === "BUY" ? "#00d4a0" : type === "SELL" ? "#ff4d6d" : "#5a7a9a", border: `1px solid ${type === "BUY" ? "#00d4a044" : type === "SELL" ? "#ff4d6d44" : "#1a284044"}` }),
+    main: { padding: 16, overflowY: "auto" },
+    card: { background: "#0f1828", border: "1px solid #1a2840", borderRadius: 6, padding: 14, marginBottom: 12 },
+    cardTitle: { color: "#7b9dc0", fontSize: 11, letterSpacing: 2, marginBottom: 10 },
+    statRow: { display: "flex", gap: 12, marginBottom: 12 },
+    stat: { flex: 1, background: "#0b1220", border: "1px solid #1a2840", borderRadius: 4, padding: "10px 12px" },
+    statLabel: { color: "#5a7a9a", fontSize: 10, marginBottom: 4 },
+    statValue: { fontSize: 16, fontWeight: 700, color: "#c8d6e5" },
+    btn: (color = "#00d4a0") => ({ background: color + "18", border: `1px solid ${color}44`, color, padding: "7px 14px", borderRadius: 4, cursor: "pointer", fontSize: 12, fontFamily: "inherit", letterSpacing: 1 }),
+    input: { background: "#080d14", border: "1px solid #1a2840", color: "#c8d6e5", padding: "6px 10px", borderRadius: 4, fontSize: 12, fontFamily: "inherit", width: "100%" },
+    logEntry: (type) => ({ padding: "4px 0", borderBottom: "1px solid #0f1828", color: type === "success" ? "#00d4a0" : type === "danger" ? "#ff4d6d" : "#7b9dc0", fontSize: 11 }),
+  };
+
+  return (
+    <div style={s.app}>
+      <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;700&display=swap" rel="stylesheet" />
+      <div style={s.header}>
+        <div style={s.logo}>
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M3 12h4l3-8 4 16 3-8h4" stroke="#00d4a0" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+          <span style={s.logoText}>FOREXBOT</span>
+          <span style={s.badge("#00d4a0")}>● LIVE</span>
+        </div>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <span style={s.badge("#60a5fa")}>Balance: ${portfolio.balance.toFixed(2)}</span>
+          <button style={s.btn(autoTrade ? "#00d4a0" : "#ff4d6d")} onClick={() => { setAutoTrade(!autoTrade); addLog(autoTrade ? "AutoTrade DÉSACTIVÉ" : "AutoTrade ACTIVÉ", autoTrade ? "danger" : "success"); }}>
+            {autoTrade ? "⚡ AUTO ON" : "⏸ AUTO OFF"}
+          </button>
+        </div>
+      </div>
+
+      <div style={s.nav}>
+        {[["dashboard", "DASHBOARD"], ["chart", "GRAPHIQUE"], ["backtest", "BACKTEST"], ["portfolio", "PORTEFEUILLE"], ["journal", "JOURNAL"]].map(([id, label]) => (
+          <button key={id} style={s.navBtn(tab === id)} onClick={() => setTab(id)}>{label}</button>
+        ))}
+      </div>
+
+      {tab === "dashboard" && (
+        <div style={s.grid}>
+          {/* Pairs sidebar */}
+          <div style={s.panel}>
+            <div style={{ ...s.panelTitle, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span>PAIRES</span>
+              <button style={{ ...s.btn("#60a5fa"), padding: "3px 8px", fontSize: 10 }} onClick={scanMarket}>{isScanning ? "..." : "SCAN"}</button>
+            </div>
+            {PAIRS.map(p => {
+              const sg = signals[p];
+              const c = allCandles[p];
+              const price = c?.length ? c[c.length - 1].close : 0;
+              return (
+                <div key={p} style={s.pairRow(activePair === p)} onClick={() => setActivePair(p)}>
+                  <div>
+                    <div style={{ fontWeight: 700, color: activePair === p ? "#c8d6e5" : "#7b9dc0" }}>{p}</div>
+                    <div style={{ fontSize: 11, color: "#5a7a9a" }}>{price.toFixed(p.includes("JPY") ? 3 : 5)}</div>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                    <span style={s.sigBadge(sg?.type)}>{sg?.type || "—"}</span>
+                    {c && <MiniChart candles={c} signal={sg || { type: "NEUTRAL" }} width={80} height={30} />}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Main */}
+          <div style={{ ...s.main }}>
+            <div style={s.statRow}>
+              <div style={s.stat}>
+                <div style={s.statLabel}>PAIRE</div>
+                <div style={{ ...s.statValue, color: "#60a5fa" }}>{activePair}</div>
+              </div>
+              <div style={s.stat}>
+                <div style={s.statLabel}>PRIX</div>
+                <div style={s.statValue}>{currentPrice.toFixed(activePair.includes("JPY") ? 3 : 5)}</div>
+              </div>
+              <div style={s.stat}>
+                <div style={s.statLabel}>SIGNAL</div>
+                <div style={{ ...s.statValue, color: sig?.type === "BUY" ? "#00d4a0" : sig?.type === "SELL" ? "#ff4d6d" : "#7b9dc0" }}>{sig?.type || "—"}</div>
+              </div>
+              <div style={s.stat}>
+                <div style={s.statLabel}>RSI</div>
+                <div style={{ ...s.statValue, color: sig?.rsi < 30 ? "#00d4a0" : sig?.rsi > 70 ? "#ff4d6d" : "#c8d6e5" }}>{sig?.rsi?.toFixed(1) || "—"}</div>
+              </div>
+              <div style={s.stat}>
+                <div style={s.statLabel}>FORCE</div>
+                <div style={s.statValue}>{"▮".repeat(sig?.strength || 0)}{"▯".repeat(6 - (sig?.strength || 0))}</div>
+              </div>
+            </div>
+
+            {sig && sig.type !== "NEUTRAL" && (
+              <div style={{ ...s.card, borderColor: sig.type === "BUY" ? "#00d4a044" : "#ff4d6d44" }}>
+                <div style={s.cardTitle}>SIGNAL — {sig.type === "BUY" ? "ACHAT" : "VENTE"}</div>
+                <div style={s.statRow}>
+                  <div style={s.stat}><div style={s.statLabel}>ENTRÉE</div><div style={{ color: "#c8d6e5", fontWeight: 700 }}>{sig.entry?.toFixed(5)}</div></div>
+                  <div style={s.stat}><div style={s.statLabel}>STOP LOSS</div><div style={{ color: "#ff4d6d", fontWeight: 700 }}>{sig.sl?.toFixed(5)}</div></div>
+                  <div style={s.stat}><div style={s.statLabel}>TAKE PROFIT</div><div style={{ color: "#00d4a0", fontWeight: 700 }}>{sig.tp?.toFixed(5)}</div></div>
+                  <div style={s.stat}><div style={s.statLabel}>R/R</div><div style={{ color: "#f0c040", fontWeight: 700 }}>1:2.5</div></div>
+                </div>
+                <button style={s.btn(sig.type === "BUY" ? "#00d4a0" : "#ff4d6d")} onClick={() => {
+                  setPortfolio(pf => {
+                    const lot = pf.balance * 0.02;
+                    addLog(`TRADE MANUEL ${sig.type} ${activePair} @ ${sig.entry?.toFixed(5)}`, sig.type === "BUY" ? "success" : "danger");
+                    return { ...pf, openTrades: [...pf.openTrades, { id: Date.now(), pair: activePair, type: sig.type, entry: sig.entry, sl: sig.sl, tp: sig.tp, lot, time: new Date().toLocaleTimeString() }] };
+                  });
+                }}>
+                  ▶ EXÉCUTER LE TRADE
+                </button>
+              </div>
+            )}
+
+            <div style={s.card}>
+              <div style={s.cardTitle}>ANALYSE IA</div>
+              <button style={{ ...s.btn("#a78bfa"), marginBottom: 10 }} onClick={getAiAnalysis} disabled={aiLoading}>
+                {aiLoading ? "⏳ Analyse en cours..." : "🤖 ANALYSER AVEC L'IA"}
+              </button>
+              {aiAnalysis && <div style={{ color: "#c8d6e5", lineHeight: 1.7, fontSize: 12 }}>{aiAnalysis}</div>}
+            </div>
+          </div>
+
+          {/* Log sidebar */}
+          <div style={s.panel}>
+            <div style={s.panelTitle}>JOURNAL EN DIRECT</div>
+            <div style={{ padding: "8px 14px", overflowY: "auto", height: "calc(100% - 40px)" }}>
+              {log.map((l, i) => (
+                <div key={i} style={s.logEntry(l.type)}>
+                  <span style={{ color: "#3a5a7a" }}>{l.time}</span> {l.msg}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {tab === "chart" && (
+        <div style={{ padding: 20 }}>
+          <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+            {PAIRS.map(p => <button key={p} style={s.btn(activePair === p ? "#00d4a0" : "#5a7a9a")} onClick={() => setActivePair(p)}>{p}</button>)}
+          </div>
+          <div style={s.card}>
+            <div style={{ ...s.cardTitle, marginBottom: 6 }}>{activePair} — CHANDELLES 15M</div>
+            <CandleChart candles={candles} pair={activePair} />
+          </div>
+          <div style={s.card}>
+            <div style={{ ...s.cardTitle, marginBottom: 4 }}>RSI (14)</div>
+            <RSIChart candles={candles} />
+          </div>
+          <div style={s.statRow}>
+            <div style={s.stat}><div style={s.statLabel}>EMA20</div><div style={{ color: "#f0c040" }}>{calcEMA(candles.map(c => c.close), 20).slice(-1)[0]?.toFixed(5)}</div></div>
+            <div style={s.stat}><div style={s.statLabel}>EMA50</div><div style={{ color: "#a78bfa" }}>{calcEMA(candles.map(c => c.close), 50).slice(-1)[0]?.toFixed(5)}</div></div>
+            <div style={s.stat}><div style={s.statLabel}>RSI</div><div>{calcRSI(candles.map(c => c.close)).slice(-1)[0]?.toFixed(1)}</div></div>
+            <div style={s.stat}><div style={s.statLabel}>MACD</div><div>{calcMACD(candles.map(c => c.close)).macd.slice(-1)[0]?.toFixed(6)}</div></div>
+          </div>
+        </div>
+      )}
+
+      {tab === "backtest" && (
+        <div style={{ padding: 20 }}>
+          <div style={s.card}>
+            <div style={s.cardTitle}>PARAMÈTRES DE STRATÉGIE</div>
+            <div style={s.statRow}>
+              <div style={s.stat}>
+                <div style={s.statLabel}>PAIRE</div>
+                <select style={s.input} value={btPair} onChange={e => setBtPair(e.target.value)}>
+                  {PAIRS.map(p => <option key={p} value={p}>{p}</option>)}
+                </select>
+              </div>
+              <div style={s.stat}>
+                <div style={s.statLabel}>RSI SURVENTE</div>
+                <input style={s.input} type="number" value={btParams.rsiOversold} onChange={e => setBtParams({ ...btParams, rsiOversold: +e.target.value })} />
+              </div>
+              <div style={s.stat}>
+                <div style={s.statLabel}>RSI SURACHAT</div>
+                <input style={s.input} type="number" value={btParams.rsiOverbought} onChange={e => setBtParams({ ...btParams, rsiOverbought: +e.target.value })} />
+              </div>
+              <div style={s.stat}>
+                <div style={s.statLabel}>TP MULTIPLICATEUR</div>
+                <input style={s.input} type="number" step="0.5" value={btParams.tpMultiplier} onChange={e => setBtParams({ ...btParams, tpMultiplier: +e.target.value })} />
+              </div>
+              <div style={s.stat}>
+                <div style={s.statLabel}>SL MULTIPLICATEUR</div>
+                <input style={s.input} type="number" step="0.5" value={btParams.slMultiplier} onChange={e => setBtParams({ ...btParams, slMultiplier: +e.target.value })} />
+              </div>
+            </div>
+            <button style={s.btn("#00d4a0")} onClick={doBacktest}>▶ LANCER LE BACKTEST</button>
+          </div>
+          {btResult && (
+            <>
+              <div style={s.statRow}>
+                <div style={s.stat}><div style={s.statLabel}>TOTAL TRADES</div><div style={s.statValue}>{btResult.totalTrades}</div></div>
+                <div style={s.stat}><div style={s.statLabel}>GAGNANTS</div><div style={{ ...s.statValue, color: "#00d4a0" }}>{btResult.wins}</div></div>
+                <div style={s.stat}><div style={s.statLabel}>PERDANTS</div><div style={{ ...s.statValue, color: "#ff4d6d" }}>{btResult.losses}</div></div>
+                <div style={s.stat}><div style={s.statLabel}>WIN RATE</div><div style={{ ...s.statValue, color: btResult.winRate >= 50 ? "#00d4a0" : "#ff4d6d" }}>{btResult.winRate.toFixed(1)}%</div></div>
+                <div style={s.stat}><div style={s.statLabel}>P&L TOTAL</div><div style={{ ...s.statValue, color: btResult.totalPnl >= 0 ? "#00d4a0" : "#ff4d6d" }}>{btResult.totalPnl >= 0 ? "+" : ""}{(btResult.totalPnl * 10000).toFixed(0)} pips</div></div>
+              </div>
+              <div style={s.card}>
+                <div style={s.cardTitle}>HISTORIQUE DES TRADES</div>
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                    <thead>
+                      <tr style={{ color: "#5a7a9a" }}>
+                        {["#", "TYPE", "ENTRÉE", "SORTIE", "RÉSULTAT", "P&L (pips)"].map(h => <th key={h} style={{ textAlign: "left", padding: "6px 8px", borderBottom: "1px solid #1a2840" }}>{h}</th>)}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {btResult.trades.map((t, i) => (
+                        <tr key={i} style={{ borderBottom: "1px solid #0f1828" }}>
+                          <td style={{ padding: "5px 8px", color: "#5a7a9a" }}>{i + 1}</td>
+                          <td style={{ padding: "5px 8px", color: t.type === "BUY" ? "#00d4a0" : "#ff4d6d" }}>{t.type}</td>
+                          <td style={{ padding: "5px 8px" }}>{t.entry.toFixed(5)}</td>
+                          <td style={{ padding: "5px 8px" }}>{t.exit?.toFixed(5)}</td>
+                          <td style={{ padding: "5px 8px", color: t.result === "TP" ? "#00d4a0" : "#ff4d6d" }}>{t.result}</td>
+                          <td style={{ padding: "5px 8px", color: t.pnl >= 0 ? "#00d4a0" : "#ff4d6d" }}>{(t.pnl * 10000).toFixed(0)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {tab === "portfolio" && (
+        <div style={{ padding: 20 }}>
+          <div style={s.statRow}>
+            <div style={s.stat}><div style={s.statLabel}>SOLDE</div><div style={s.statValue}>${portfolio.balance.toFixed(2)}</div></div>
+            <div style={s.stat}><div style={s.statLabel}>TRADES OUVERTS</div><div style={s.statValue}>{portfolio.openTrades.length}</div></div>
+            <div style={s.stat}><div style={s.statLabel}>TRADES FERMÉS</div><div style={s.statValue}>{portfolio.closedTrades.length}</div></div>
+            <div style={s.stat}>
+              <div style={s.statLabel}>P&L RÉALISÉ</div>
+              <div style={{ ...s.statValue, color: portfolio.closedTrades.reduce((s, t) => s + t.pnl, 0) >= 0 ? "#00d4a0" : "#ff4d6d" }}>
+                ${portfolio.closedTrades.reduce((s, t) => s + t.pnl, 0).toFixed(2)}
+              </div>
+            </div>
+          </div>
+
+          <div style={s.card}>
+            <div style={s.cardTitle}>POSITIONS OUVERTES</div>
+            {portfolio.openTrades.length === 0 ? <div style={{ color: "#5a7a9a" }}>Aucune position ouverte</div> : (
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                <thead>
+                  <tr style={{ color: "#5a7a9a" }}>
+                    {["PAIRE", "TYPE", "ENTRÉE", "SL", "TP", "LOT", "HEURE", "ACTION"].map(h => <th key={h} style={{ textAlign: "left", padding: "6px 8px", borderBottom: "1px solid #1a2840" }}>{h}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {portfolio.openTrades.map(t => (
+                    <tr key={t.id} style={{ borderBottom: "1px solid #0f1828" }}>
+                      <td style={{ padding: "5px 8px", color: "#60a5fa" }}>{t.pair}</td>
+                      <td style={{ padding: "5px 8px", color: t.type === "BUY" ? "#00d4a0" : "#ff4d6d" }}>{t.type}</td>
+                      <td style={{ padding: "5px 8px" }}>{t.entry?.toFixed(5)}</td>
+                      <td style={{ padding: "5px 8px", color: "#ff4d6d" }}>{t.sl?.toFixed(5)}</td>
+                      <td style={{ padding: "5px 8px", color: "#00d4a0" }}>{t.tp?.toFixed(5)}</td>
+                      <td style={{ padding: "5px 8px" }}>{t.lot?.toFixed(2)}$</td>
+                      <td style={{ padding: "5px 8px", color: "#5a7a9a" }}>{t.time}</td>
+                      <td style={{ padding: "5px 8px" }}><button style={{ ...s.btn("#ff4d6d"), padding: "3px 8px" }} onClick={() => closeTrade(t.id)}>FERMER</button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          <div style={s.card}>
+            <div style={s.cardTitle}>TRADES FERMÉS</div>
+            {portfolio.closedTrades.length === 0 ? <div style={{ color: "#5a7a9a" }}>Aucun trade fermé</div> : (
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                <thead>
+                  <tr style={{ color: "#5a7a9a" }}>
+                    {["PAIRE", "TYPE", "ENTRÉE", "SORTIE", "P&L", "HEURE"].map(h => <th key={h} style={{ textAlign: "left", padding: "6px 8px", borderBottom: "1px solid #1a2840" }}>{h}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {portfolio.closedTrades.map((t, i) => (
+                    <tr key={i} style={{ borderBottom: "1px solid #0f1828" }}>
+                      <td style={{ padding: "5px 8px", color: "#60a5fa" }}>{t.pair}</td>
+                      <td style={{ padding: "5px 8px", color: t.type === "BUY" ? "#00d4a0" : "#ff4d6d" }}>{t.type}</td>
+                      <td style={{ padding: "5px 8px" }}>{t.entry?.toFixed(5)}</td>
+                      <td style={{ padding: "5px 8px" }}>{t.exitPrice?.toFixed(5)}</td>
+                      <td style={{ padding: "5px 8px", color: t.pnl >= 0 ? "#00d4a0" : "#ff4d6d" }}>{t.pnl >= 0 ? "+" : ""}{t.pnl?.toFixed(2)}$</td>
+                      <td style={{ padding: "5px 8px", color: "#5a7a9a" }}>{t.closeTime}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      )}
+
+      {tab === "journal" && (
+        <div style={{ padding: 20 }}>
+          <div style={s.card}>
+            <div style={s.cardTitle}>JOURNAL COMPLET</div>
+            {log.map((l, i) => (
+              <div key={i} style={{ ...s.logEntry(l.type), padding: "5px 0" }}>
+                <span style={{ color: "#3a5a7a", marginRight: 10 }}>{l.time}</span>
+                <span style={{ marginRight: 6 }}>{l.type === "success" ? "✓" : l.type === "danger" ? "✗" : "·"}</span>
+                {l.msg}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
