@@ -1,0 +1,330 @@
+import os
+import time
+import logging
+import requests
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from apscheduler.schedulers.background import BackgroundScheduler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+TG_TOKEN   = "8899252346:AAFJ7Q2hEQVcni7VagQxSiFUcOAWE4Eg1z8"
+TG_CHAT_ID = "8678230305"
+
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
+log = logging.getLogger(__name__)
+
+bot_state = {
+    "active": True,
+    "last_signal": None,
+    "signals_sent": 0,
+    "start_time": datetime.now(),
+    "last_price": 0.0,
+}
+
+def get_xauusd_price():
+    try:
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m&range=1d"
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        data = r.json()
+        return float(data["chart"]["result"][0]["meta"]["regularMarketPrice"])
+    except:
+        return bot_state["last_price"] or 2345.0
+
+def get_xauusd_candles(n=100):
+    try:
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=15m&range=5d"
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        data = r.json()
+        result = data["chart"]["result"][0]
+        timestamps = result["timestamp"]
+        ohlcv = result["indicators"]["quote"][0]
+        df = pd.DataFrame({
+            "time":   pd.to_datetime(timestamps, unit="s"),
+            "open":   ohlcv["open"],
+            "high":   ohlcv["high"],
+            "low":    ohlcv["low"],
+            "close":  ohlcv["close"],
+            "volume": ohlcv["volume"],
+        }).dropna()
+        return df.tail(n).reset_index(drop=True)
+    except Exception as e:
+        log.error(f"Erreur candles: {e}")
+        return pd.DataFrame()
+
+def compute_atr(df, period=14):
+    hl = df["high"] - df["low"]
+    hc = np.abs(df["high"] - df["close"].shift())
+    lc = np.abs(df["low"]  - df["close"].shift())
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+def detect_regime(df):
+    df = df.copy()
+    df["atr"] = compute_atr(df)
+    df["e20"] = ema(df["close"], 20)
+    df["e50"] = ema(df["close"], 50)
+    slope    = df["e20"].iloc[-1] - df["e50"].iloc[-1]
+    atr_now  = df["atr"].iloc[-1]
+    atr_mean = df["atr"].mean()
+    if slope > 0 and atr_now > atr_mean: return "TREND_UP"
+    if slope < 0 and atr_now > atr_mean: return "TREND_DOWN"
+    return "RANGE"
+
+def detect_bos(df):
+    n = len(df)
+    if n < 10: return {"bos": False}
+    res = df["high"].iloc[-10:-1].max()
+    sup = df["low"].iloc[-10:-1].min()
+    last_close = df["close"].iloc[-1]
+    if last_close > res: return {"bos": True, "type": "bullish", "level": res}
+    if last_close < sup: return {"bos": True, "type": "bearish", "level": sup}
+    return {"bos": False}
+
+def detect_sweep(df):
+    prev_high  = df["high"].iloc[-2]
+    prev_low   = df["low"].iloc[-2]
+    last_close = df["close"].iloc[-1]
+    last_high  = df["high"].iloc[-1]
+    last_low   = df["low"].iloc[-1]
+    if last_low < prev_low and last_close > prev_low:    return "SWEEP_BUY"
+    if last_high > prev_high and last_close < prev_high: return "SWEEP_SELL"
+    return "NO_SWEEP"
+
+def momentum_ok(df):
+    c = df.iloc[-1]
+    body  = abs(c["close"] - c["open"])
+    range_= c["high"] - c["low"]
+    return range_ > 0 and (body / range_) > 0.60
+
+def analyze(df):
+    if df.empty or len(df) < 55:
+        return {"signal": "NO_DATA"}
+    closes  = df["close"]
+    regime  = detect_regime(df)
+    bos     = detect_bos(df)
+    sweep   = detect_sweep(df)
+    mom     = momentum_ok(df)
+    rsi_val = compute_rsi(closes).iloc[-1]
+    atr_val = compute_atr(df).iloc[-1]
+    e20     = ema(closes, 20).iloc[-1]
+    e50     = ema(closes, 50).iloc[-1]
+    price   = closes.iloc[-1]
+    score   = 0
+    signal  = "WAIT"
+    if regime == "TREND_UP":
+        if bos.get("type") == "bullish": score += 2
+        if sweep == "SWEEP_BUY":         score += 2
+        if mom:                           score += 1
+        if rsi_val < 60:                  score += 1
+        if score >= 3: signal = "BUY"
+    elif regime == "TREND_DOWN":
+        if bos.get("type") == "bearish": score += 2
+        if sweep == "SWEEP_SELL":         score += 2
+        if mom:                           score += 1
+        if rsi_val > 40:                  score += 1
+        if score >= 3: signal = "SELL"
+    sl = round(price - atr_val * 1.5, 2) if signal == "BUY"  else round(price + atr_val * 1.5, 2) if signal == "SELL" else None
+    tp = round(price + atr_val * 3.0, 2) if signal == "BUY"  else round(price - atr_val * 3.0, 2) if signal == "SELL" else None
+    return {
+        "signal": signal, "regime": regime, "bos": bos,
+        "sweep": sweep, "mom": mom, "rsi": round(rsi_val, 1),
+        "atr": round(atr_val, 2), "price": round(price, 2),
+        "e20": round(e20, 2), "e50": round(e50, 2),
+        "sl": sl, "tp": tp, "score": min(score, 5),
+        "time": datetime.now().strftime("%d/%m %H:%M"),
+    }
+
+def format_signal(a):
+    if a.get("signal") == "NO_DATA":
+        return "⚠️ Données indisponibles"
+    sig   = a["signal"]
+    emoji = "🟢 ACHAT" if sig == "BUY" else "🔴 VENTE" if sig == "SELL" else "⏳ EN ATTENTE"
+    bars  = "▰" * a["score"] + "▱" * (5 - a["score"])
+    rr    = round(abs(a["tp"] - a["price"]) / abs(a["price"] - a["sl"]), 1) if a["sl"] and a["tp"] and a["price"] != a["sl"] else "—"
+    msg = (
+        f"*{'━'*22}*\n"
+        f"⚡ *SIGNAL XAUUSD — {emoji}*\n"
+        f"*{'━'*22}*\n\n"
+        f"💲 Prix : `{a['price']:.2f}`\n"
+        f"📈 Régime : `{a['regime']}`\n"
+        f"💪 Force : `{bars}` {a['score']}/5\n\n"
+        f"*📋 ANALYSE SMC*\n"
+        f"├ BOS    : {'✅' if a['bos'].get('bos') else '❌'} `{a['bos'].get('type','—')}`\n"
+        f"├ Sweep  : {'✅' if a['sweep'] != 'NO_SWEEP' else '❌'} `{a['sweep']}`\n"
+        f"├ Momentum: {'✅' if a['mom'] else '❌'}\n"
+        f"├ RSI    : `{a['rsi']}`\n"
+        f"├ EMA20  : `{a['e20']}`\n"
+        f"└ EMA50  : `{a['e50']}`\n"
+    )
+    if sig in ("BUY", "SELL"):
+        msg += (
+            f"\n*🎯 NIVEAUX*\n"
+            f"├ 🔵 Entrée : `{a['price']:.2f}`\n"
+            f"├ 🔴 SL     : `{a['sl']:.2f}`\n"
+            f"├ 🟢 TP     : `{a['tp']:.2f}`\n"
+            f"└ ⚖️  R/R    : `1:{rr}`\n\n"
+            f"⚠️ _Exécutez sur MT5 manuellement_\n"
+        )
+    msg += f"\n🕐 `{a['time']}`"
+    return msg
+
+def send_telegram(text, keyboard=None):
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    if keyboard:
+        payload["reply_markup"] = {"inline_keyboard": keyboard}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        log.error(f"Telegram error: {e}")
+
+def auto_scan():
+    if not bot_state["active"]: return
+    log.info("Scan en cours...")
+    df = get_xauusd_candles()
+    a  = analyze(df)
+    bot_state["last_price"] = a.get("price", 0)
+    if a["signal"] in ("BUY", "SELL"):
+        if bot_state["last_signal"] == a["signal"]: return
+        bot_state["last_signal"]   = a["signal"]
+        bot_state["signals_sent"] += 1
+        keyboard = [[
+            {"text": "✅ Pris",     "callback_data": "taken"},
+            {"text": "❌ Ignoré",  "callback_data": "ignored"},
+            {"text": "📊 Détails", "callback_data": "details"},
+        ]]
+        send_telegram(format_signal(a), keyboard)
+    else:
+        bot_state["last_signal"] = None
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "🤖 *XAUUSD AI SIGNAL BOT*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Bienvenue ! Je surveille XAUUSD 24/7\n\n"
+        "*/signal* — Analyse immédiate\n"
+        "*/prix*   — Prix actuel\n"
+        "*/status* — État du bot\n"
+        "*/stop*   — Pause alertes\n"
+        "*/resume* — Reprendre alertes\n"
+        "*/aide*   — Aide complète"
+    )
+    kb = [[
+        InlineKeyboardButton("📊 Signal", callback_data="scan"),
+        InlineKeyboardButton("💲 Prix",   callback_data="price"),
+    ]]
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+
+async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Analyse en cours...")
+    df = get_xauusd_candles()
+    a  = analyze(df)
+    kb = [[
+        InlineKeyboardButton("✅ Pris",    callback_data="taken"),
+        InlineKeyboardButton("❌ Ignoré", callback_data="ignored"),
+    ]]
+    await update.message.reply_text(format_signal(a), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uptime = str(datetime.now() - bot_state["start_time"]).split(".")[0]
+    msg = (
+        f"📊 *STATUS*\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🟢 Uptime : `{uptime}`\n"
+        f"📨 Signaux : `{bot_state['signals_sent']}`\n"
+        f"💲 Dernier prix : `{bot_state['last_price']}`\n"
+        f"⚡ Actif : `{bot_state['active']}`"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def cmd_prix(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    price = get_xauusd_price()
+    await update.message.reply_text(f"💲 *XAUUSD* : `{price:.2f}` USD", parse_mode="Markdown")
+
+async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    bot_state["active"] = False
+    await update.message.reply_text("⏸ Alertes *pausées*. Tapez /resume pour reprendre.", parse_mode="Markdown")
+
+async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    bot_state["active"] = True
+    await update.message.reply_text("▶️ Alertes *reprises* !", parse_mode="Markdown")
+
+async def cmd_aide(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "📖 *AIDE*\n━━━━━━━━━━━━━━━\n"
+        "*/signal* — Analyse SMC maintenant\n"
+        "*/prix*   — Prix spot XAUUSD\n"
+        "*/status* — Stats du bot\n"
+        "*/stop*   — Pause les alertes auto\n"
+        "*/resume* — Reprend les alertes\n\n"
+        "📨 Scan automatique toutes les *15 min*\n"
+        "🎯 Signal envoyé si score ≥ 3/5"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data == "scan":
+        df = get_xauusd_candles()
+        a  = analyze(df)
+        await q.message.reply_text(format_signal(a), parse_mode="Markdown")
+    elif q.data == "price":
+        price = get_xauusd_price()
+        await q.message.reply_text(f"💲 *XAUUSD* : `{price:.2f}`", parse_mode="Markdown")
+    elif q.data == "taken":
+        await q.message.reply_text("✅ *Trade pris ! Bonne chance !* 🎯", parse_mode="Markdown")
+    elif q.data == "ignored":
+        await q.message.reply_text("❌ Ignoré. Le bot continue de surveiller.", parse_mode="Markdown")
+    elif q.data == "details":
+        df = get_xauusd_candles()
+        a  = analyze(df)
+        msg = (
+            f"📋 *DÉTAILS*\n━━━━━━━━━━━━━━━\n"
+            f"ATR   : `{a.get('atr','—')}`\n"
+            f"EMA20 : `{a.get('e20','—')}`\n"
+            f"EMA50 : `{a.get('e50','—')}`\n"
+            f"RSI   : `{a.get('rsi','—')}`\n"
+            f"Sweep : `{a.get('sweep','—')}`\n"
+            f"Régime: `{a.get('regime','—')}`"
+        )
+        await q.message.reply_text(msg, parse_mode="Markdown")
+
+def main():
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(auto_scan, "interval", minutes=15)
+    scheduler.start()
+    send_telegram(
+        "🚀 *BOT XAUUSD DÉMARRÉ*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "✅ Surveillance active 24/7\n"
+        "📊 Scan toutes les 15 min\n"
+        "💬 Tapez /aide pour les commandes"
+    )
+    time.sleep(3)
+    auto_scan()
+    app = Application.builder().token(TG_TOKEN).build()
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("signal", cmd_signal))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("prix",   cmd_prix))
+    app.add_handler(CommandHandler("stop",   cmd_stop))
+    app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("aide",   cmd_aide))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
